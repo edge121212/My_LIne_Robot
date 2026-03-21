@@ -1,164 +1,101 @@
 # My Line Robot (PDF Asker)
 
-這是一個 LINE Bot + Gemini 的 PDF 問答機器人。
+LINE Bot + LangChain + Gemini 的 PDF 問答機器人。
 
-你可以：
-- 在 LINE 上傳 PDF 檔案（僅支援 .pdf）
-- 直接提問，機器人會綜合 data 內所有 PDF 回答
-- 用指令清除上傳來源
+目前功能：
+- 接收 LINE 文字訊息並依 PDF 內容回答
+- 接收 LINE 上傳的 PDF 檔案（`.pdf`）
+- 自動切分文件並建立/更新 Chroma 向量索引
+- 遇到 Gemini 配額超限（429）時，回覆可讀提示
 
----
-
-## 1. 專案結構
+## 專案結構
 
 ```text
 My_Line_Robot/
 ├─ pdfAsker.py
+├─ README.md
 ├─ .env
+├─ .gitignore
 └─ data/
-	└─ uploads/
+	 └─ uploads/
 ```
 
----
-
-## 2. 需求環境
+## 需求環境
 
 - Python 3.10+
-- ngrok（用於把本機 webhook 暴露給 LINE）
 - LINE Messaging API Channel
-- Google AI Studio API Key（Gemini）
+- Google AI Studio API Key
+- ngrok（本機 webhook 測試）
 
----
-
-## 3. 安裝套件
+## 安裝套件
 
 在專案根目錄執行：
 
 ```bash
-pip install flask line-bot-sdk google-generativeai python-dotenv
+pip install flask line-bot-sdk python-dotenv \
+	langchain langchain-community langchain-text-splitters \
+	langchain-google-genai langchain-huggingface chromadb
 ```
 
----
-
-## 4. .env 設定（含 ngrok env）
-
-在專案根目錄建立或編輯 .env：
+## 環境變數 `.env`
 
 ```env
-# LINE
 LINE_CHANNEL_ACCESS_TOKEN=你的_LINE_Channel_Access_Token
 LINE_CHANNEL_SECRET=你的_LINE_Channel_Secret
-
-# Gemini
 GOOGLE_API_KEY=你的_Google_API_Key
-
-# ngrok (可選，建議加上)
-NGROK_AUTHTOKEN=你的_ngrok_authtoken
 ```
 
 注意：
-- .env 內請不要有多餘空白或引號。
-- 不要把 .env 上傳到公開版本庫。
+- `.env` 不要上傳到公開 repo
+- 變數值不要加引號
 
----
-
-## 5. 啟動 Bot
+## 啟動方式
 
 ```bash
 python pdfAsker.py
 ```
 
-預設會啟動在：http://127.0.0.1:5000
+預設啟動：`http://127.0.0.1:5000`
 
----
+## ngrok 與 Webhook
 
-## 6. 設定 ngrok
-
-### 6.1 第一次使用：設定 ngrok authtoken
-
-方式 A（直接設定）：
-
-```bash
-ngrok config add-authtoken 你的_ngrok_authtoken
-```
-
-方式 B（使用環境變數，Windows PowerShell）：
-
-```powershell
-$env:NGROK_AUTHTOKEN="你的_ngrok_authtoken"
-ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-```
-
-### 6.2 建立對外 tunnel
+1. 啟動 tunnel
 
 ```bash
 ngrok http 5000
 ```
 
-你會拿到一個公開網址，例如：
+2. 到 LINE Developers 設定 Webhook URL 為：
 
 ```text
-https://xxxx-xxxx-xxxx.ngrok-free.app
+https://你的-ngrok-網址/callback
 ```
 
----
+3. 開啟 `Use webhook` 並按 `Verify`
 
-## 7. LINE Webhook 設定
+## 使用方式
 
-到 LINE Developers Console：
+1. 先在 LINE 上傳 PDF（副檔名需為 `.pdf`）
+2. 再發送問題文字
+3. Bot 會從已載入文件中檢索並回答
 
-1. 打開你的 Messaging API Channel
-2. Webhook URL 填入：
+補充：
+- 啟動時若存在 `data/GA04-GA-basic-1.pdf`，會先載入
+- 後續上傳的 PDF 會存到 `data/uploads/`
 
-```text
-https://你的_ngrok_網址/callback
-```
+## 常見問題
 
-3. 啟用 Use webhook
-4. 按 Verify 測試是否成功
+### 1) 出現 429 / RESOURCE_EXHAUSTED
 
----
+代表 Gemini 配額達上限，請等待錯誤中的 `retry in xx s` 秒數後再試，或升級方案。
 
-## 8. 使用方式
+### 2) Bot 說「還沒有上傳 PDF」
 
-Bot 主要功能：
+代表向量庫沒有可用文件。請先上傳 PDF，或確認預設檔案路徑存在。
 
-- 上傳 PDF：傳送 .pdf 檔案即可加入資料來源
-- 問問題：直接輸入文字問題
-- 查看說明：輸入 使用說明
-- 清空上傳檔案：輸入 清除檔案
+### 3) Webhook Verify 失敗
 
-程式會讀取：
-- data/ 下所有 .pdf
-- data/uploads/ 下使用者上傳的 .pdf
-
----
-
-## 9. 常見問題
-
-### Q1: Verify Webhook 失敗
-
-- 確認程式有在執行（port 5000）
-- 確認 ngrok 連的是 5000
-- 確認 Webhook URL 最後有 /callback
-- 確認 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN 正確
-
-### Q2: Bot 回覆找不到 PDF
-
-- 確認 data 或 data/uploads 內有 .pdf
-- 檔名副檔名必須是 .pdf
-
-### Q3: Gemini 呼叫失敗
-
-- 確認 GOOGLE_API_KEY 正確
-- 確認 API key 有啟用可用模型
-
----
-
-## 10. 開發備註
-
-- 主要入口檔案：pdfAsker.py
-- Flask endpoint：POST /callback
-- 本機執行埠：5000
-
-如果你要部署到雲端（Render / Railway / Azure），只要把相同環境變數帶上即可，不一定要使用 ngrok。
+- 確認 `pdfAsker.py` 正在執行
+- 確認 ngrok 指到 `5000`
+- 確認 URL 最後是 `/callback`
+- 確認 LINE token/secret 正確
