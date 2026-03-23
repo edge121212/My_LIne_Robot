@@ -15,7 +15,6 @@ from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 load_dotenv()
 app = Flask(__name__)
@@ -29,7 +28,12 @@ handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
 # 1. 初始化 LangChain 與 Gemini
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv('GOOGLE_API_KEY'))
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+CHROMA_COLLECTION_NAME = "pdf_qa_multilingual_v1"
+embeddings = HuggingFaceEmbeddings(
+    model_name=EMBEDDING_MODEL_NAME,
+    encode_kwargs={"normalize_embeddings": True}
+)
 
 # 確保上傳資料夾存在
 UPLOAD_DIR = "data/uploads"
@@ -44,14 +48,25 @@ def load_pdf_to_db(pdf_path):
     try:
         loader = PyPDFLoader(pdf_path)
         data = loader.load()
+
+        if not data:
+            print(f"No pages found in PDF: {pdf_path}")
+            return False
         
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=50)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
         chunks = text_splitter.split_documents(data)
+
+        # 過濾空白段落，避免 Chroma 在 upsert 時收到空 embeddings
+        chunks = [doc for doc in chunks if doc.page_content and doc.page_content.strip()]
+        if not chunks:
+            print(f"No extractable text found in PDF: {pdf_path}")
+            return False
         
         if vector_db is None:
             vector_db = Chroma.from_documents(
                 documents=chunks, 
                 embedding=embeddings, 
+                collection_name=CHROMA_COLLECTION_NAME,
                 persist_directory="./chroma_db"
             )
         else:
@@ -68,31 +83,48 @@ if os.path.exists(default_pdf):
     load_pdf_to_db(default_pdf)
 else:
     # 如果沒有 PDF，創建空的向量資料庫
-    vector_db = Chroma(embedding_function=embeddings, persist_directory="./chroma_db")
+    vector_db = Chroma(
+        embedding_function=embeddings,
+        collection_name=CHROMA_COLLECTION_NAME,
+        persist_directory="./chroma_db"
+    )
 
 # --- 建立檢索問答鏈 ---
 def create_qa_chain():
-    template = """請根據以下內容來回答問題：
+    template = """你是 PDF 文件問答助理。請只根據提供的內容回答。
+
+回答規則：
+1. 優先給出直接答案，再補充依據。
+2. 若內容足夠，請簡短引用「來源檔名/頁碼」。
+3. 若內容不足，明確說明缺少哪些資訊，不要臆測。
 
 {context}
 
 問題：{question}"""
     
     prompt = ChatPromptTemplate.from_template(template)
-    
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-    
-    retriever = vector_db.as_retriever(search_kwargs={"k": 3})
-    
-    qa_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+    return prompt | llm | StrOutputParser()
+
+
+def retrieve_docs(question, k=6):
+    """使用 MMR 提升多文件情境下的檢索多樣性與命中率。"""
+    retriever = vector_db.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": k, "fetch_k": 20, "lambda_mult": 0.7}
     )
+    docs = retriever.invoke(question)
+    return [doc for doc in docs if doc.page_content and doc.page_content.strip()]
     
-    return qa_chain
+
+def format_docs_with_sources(docs):
+    parts = []
+    for idx, doc in enumerate(docs, 1):
+        source = os.path.basename(doc.metadata.get("source", "未知來源"))
+        page = doc.metadata.get("page")
+        page_text = f"第{page + 1}頁" if isinstance(page, int) else "頁碼未知"
+        header = f"[片段{idx}] 來源：{source} / {page_text}"
+        parts.append(f"{header}\n{doc.page_content.strip()}")
+    return "\n\n".join(parts)
 
 
 def build_quota_exceeded_message(error_text):
@@ -120,8 +152,15 @@ def handle_message(event):
         if vector_db is None or vector_db._collection.count() == 0:
             answer = "還沒有上傳 PDF，請先上傳 PDF 文件。"
         else:
+            docs = retrieve_docs(user_msg, k=6)
+            if not docs:
+                answer = "找不到可用的文件內容，請確認 PDF 是否可擷取文字。"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=answer))
+                return
+
+            context = format_docs_with_sources(docs)
             qa_chain = create_qa_chain()
-            answer = qa_chain.invoke(user_msg)
+            answer = qa_chain.invoke({"context": context, "question": user_msg})
     except Exception as e:
         print(f"Error: {e}")
         error_text = str(e)
